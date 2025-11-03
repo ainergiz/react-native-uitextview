@@ -3,6 +3,7 @@
 #import "RNUITextViewComponentDescriptor.h"
 #import "RNUITextViewChild.h"
 #import <React/RCTConversions.h>
+#import <QuartzCore/QuartzCore.h>
 
 #import <react/renderer/textlayoutmanager/RCTAttributedTextUtils.h>
 #import <react/renderer/components/RNUITextViewSpec/EventEmitters.h>
@@ -24,7 +25,7 @@ static UIColor *RNUITextViewDefaultHighlightColor(void)
 
 @class RNUITextView;
 
-@interface RNUITextViewInternal : UITextView
+@interface RNUITextViewInternal : UITextView <UITextViewDelegate>
 @property (nonatomic, weak) RNUITextView *owner;
 @end
 
@@ -33,6 +34,7 @@ static UIColor *RNUITextViewDefaultHighlightColor(void)
 - (void)configureMenuWithBuilder:(id<UIMenuBuilder>)builder API_AVAILABLE(ios(13.0));
 - (void)handleMenuActionWithIdentifier:(NSString *)identifier;
 - (void)clearSelectionIfNecessary;
+- (void)onTextSelectionDidChange;
 
 @end
 
@@ -42,6 +44,12 @@ static UIColor *RNUITextViewDefaultHighlightColor(void)
 {
   [super buildMenuWithBuilder:builder];
   [self.owner configureMenuWithBuilder:builder];
+}
+
+- (void)textViewDidChangeSelection:(UITextView *)textView
+{
+  // Forward selection changes to owner so it can rebuild menu
+  [self.owner onTextSelectionDidChange];
 }
 
 @end
@@ -54,6 +62,7 @@ static UIColor *RNUITextViewDefaultHighlightColor(void)
   facebook::react::RNUITextViewMenuBehavior _menuBehavior;
   NSArray<NSValue *> *_highlightRanges;
   UIColor *_highlightColor;
+  NSMutableArray<CALayer *> *_highlightLayers;
 }
 
 + (ComponentDescriptorProvider)componentDescriptorProvider
@@ -73,12 +82,14 @@ static UIColor *RNUITextViewDefaultHighlightColor(void)
 
     _textView = [[RNUITextViewInternal alloc] init];
     _textView.owner = self;
+    _textView.delegate = _textView; // Set delegate to self so we get selection change callbacks
     _textView.scrollEnabled = false;
   _textView.editable = false;
   _textView.textContainerInset = UIEdgeInsetsZero;
   _textView.textContainer.lineFragmentPadding = 0;
   [self addSubview:_textView];
   _highlightColor = RNUITextViewDefaultHighlightColor();
+  _highlightLayers = [NSMutableArray array];
 
     const auto longPressGestureRecognizer = [[UILongPressGestureRecognizer alloc] initWithTarget:self
                                                                                           action:@selector(handleLongPressIfNecessary:)];
@@ -102,12 +113,16 @@ static UIColor *RNUITextViewDefaultHighlightColor(void)
   [super prepareForRecycle];
   _state.reset();
 
+  // Cancel any pending highlight updates
+  [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(updateHighlightLayers) object:nil];
+
   // Reset the frame to zero so that when it properly lays out on the next use
   _textView.frame = CGRectZero;
   _textView.attributedText = nil;
   _menuItems = nil;
   _highlightRanges = nil;
   _highlightColor = nil;
+  [self clearHighlightLayers];
 }
 
 - (void)drawRect:(CGRect)rect
@@ -121,37 +136,18 @@ static UIColor *RNUITextViewDefaultHighlightColor(void)
   const auto attrString = _state->getData().attributedString;
   const auto convertedAttrString = RCTNSAttributedStringFromAttributedString(attrString);
 
-  NSAttributedString *attributedStringToApply = convertedAttrString;
-  if (_highlightRanges.count > 0) {
-    NSMutableAttributedString *mutableString = [convertedAttrString mutableCopy];
-    UIColor *color = _highlightColor ?: RNUITextViewDefaultHighlightColor();
-    const NSUInteger stringLength = mutableString.length;
-
-    for (NSValue *value in _highlightRanges) {
-      NSRange range = value.rangeValue;
-      if (range.location == NSNotFound || range.length == 0) {
-        continue;
-      }
-
-      if (range.location >= stringLength) {
-        continue;
-      }
-
-      NSUInteger clampedLength = MIN(range.length, stringLength - range.location);
-      if (clampedLength == 0) {
-        continue;
-      }
-
-      [mutableString addAttribute:NSBackgroundColorAttributeName
-                            value:color
-                            range:NSMakeRange(range.location, clampedLength)];
-    }
-
-    attributedStringToApply = mutableString;
-  }
-
-  _textView.attributedText = attributedStringToApply;
+  _textView.attributedText = convertedAttrString;
   _textView.frame = _view.frame;
+  
+  // Ensure layout is complete before building highlight layers
+  [_textView setNeedsLayout];
+  [_textView layoutIfNeeded];
+  
+  // Rebuild highlights immediately - layout is guaranteed to be ready after layoutIfNeeded
+  // Safety checks in updateHighlightLayers ensure we handle edge cases
+  if (_highlightRanges && _highlightRanges.count > 0) {
+  [self updateHighlightLayers];
+  }
 
   const auto lines = new std::vector<std::string>();
   [_textView.layoutManager enumerateLineFragmentsForGlyphRange:NSMakeRange(0, convertedAttrString.string.length) usingBlock:^(CGRect rect,
@@ -224,7 +220,11 @@ static UIColor *RNUITextViewDefaultHighlightColor(void)
     }
   }
 
-  if (menuChanged || oldViewProps.menuBehavior != newViewProps.menuBehavior) {
+  // Always update menu items (even if unchanged) to handle view recycling
+  // After recycling, _menuItems is nil, so we need to set it even if props haven't changed
+  bool needsMenuUpdate = menuChanged || (_menuItems == nil && newViewProps.menuItems.size() > 0) || oldViewProps.menuBehavior != newViewProps.menuBehavior;
+
+  if (needsMenuUpdate) {
     NSMutableArray<NSDictionary<NSString *, NSString *> *> *items = [NSMutableArray array];
 
     for (const auto &item : newViewProps.menuItems) {
@@ -246,6 +246,7 @@ static UIColor *RNUITextViewDefaultHighlightColor(void)
     _menuBehavior = newViewProps.menuBehavior;
 
     if (@available(iOS 13.0, *)) {
+      // Force menu rebuild to ensure custom actions appear after view recycling
       [[UIMenuSystem mainSystem] setNeedsRebuild];
     }
   }
@@ -262,7 +263,11 @@ static UIColor *RNUITextViewDefaultHighlightColor(void)
     }
   }
 
-  if (highlightRangesChanged) {
+  // Always update highlight ranges (even if unchanged) to handle view recycling
+  // After recycling, _highlightRanges is nil, so we need to set it even if props haven't changed
+  bool needsHighlightUpdate = highlightRangesChanged || (_highlightRanges == nil && newViewProps.highlightRanges.size() > 0);
+
+  if (needsHighlightUpdate) {
     NSMutableArray<NSValue *> *ranges = [NSMutableArray arrayWithCapacity:newViewProps.highlightRanges.size()];
     for (const auto &range : newViewProps.highlightRanges) {
       NSInteger start = MAX(range.start, 0);
@@ -277,7 +282,17 @@ static UIColor *RNUITextViewDefaultHighlightColor(void)
 
     _highlightRanges = ranges.count > 0 ? [ranges copy] : nil;
 
+    // Always trigger drawRect to rebuild highlights after text layout
+    // Also try to rebuild immediately if text is already available (covers view recycling case)
     [self setNeedsDisplay];
+    
+    // If text is already set, rebuild highlights immediately
+    // This handles the case where updateProps runs after drawRect has already set the text
+    if (_textView.attributedText && _textView.attributedText.length > 0 && !CGRectIsEmpty(_textView.bounds)) {
+      [_textView setNeedsLayout];
+      [_textView layoutIfNeeded];
+    [self updateHighlightLayers];
+    }
   }
 
   [super updateProps:props oldProps:oldProps];
@@ -291,6 +306,17 @@ static UIColor *RNUITextViewDefaultHighlightColor(void)
 }
 
 #pragma mark - Menu Handling
+
+- (void)onTextSelectionDidChange
+{
+  // Force menu rebuild when text selection changes to ensure custom actions appear
+  // This handles cases where menu disappears after view recycling
+  if (@available(iOS 13.0, *)) {
+    if (_menuItems && _menuItems.count > 0) {
+      [[UIMenuSystem mainSystem] setNeedsRebuild];
+    }
+  }
+}
 
 - (void)configureMenuWithBuilder:(id<UIMenuBuilder>)builder API_AVAILABLE(ios(13.0))
 {
@@ -445,6 +471,102 @@ static UIColor *RNUITextViewDefaultHighlightColor(void)
   if (_textView.isFirstResponder) {
     [_textView resignFirstResponder];
   }
+}
+
+- (void)clearHighlightLayers
+{
+  if (!_highlightLayers.count) {
+    return;
+  }
+
+  for (CALayer *layer in _highlightLayers) {
+    [layer removeFromSuperlayer];
+  }
+  [_highlightLayers removeAllObjects];
+}
+
+- (void)updateHighlightLayers
+{
+  [self clearHighlightLayers];
+
+  if (!_highlightRanges || _highlightRanges.count == 0 || !_textView) {
+    return;
+  }
+
+  UITextView *textView = _textView;
+  
+  // Ensure attributedText is set and layout is ready
+  if (!textView.attributedText || textView.attributedText.length == 0) {
+    return;
+  }
+  
+  const CGRect textViewBounds = textView.bounds;
+  if (CGRectIsEmpty(textViewBounds) || CGRectIsNull(textViewBounds)) {
+    return;
+  }
+
+  // Ensure layout is complete before enumerating glyph ranges
+  [textView.layoutManager ensureLayoutForTextContainer:textView.textContainer];
+  
+  // Double-check that layout is actually ready by ensuring glyphs exist
+  NSRange fullRange = NSMakeRange(0, textView.attributedText.length);
+  if (fullRange.length == 0) {
+    return;
+  }
+  
+  NSRange glyphRange = [textView.layoutManager glyphRangeForCharacterRange:fullRange actualCharacterRange:nil];
+  if (glyphRange.location == NSNotFound || glyphRange.length == 0) {
+    // Layout not ready yet, will be retried on next drawRect
+    return;
+  }
+
+  const UIEdgeInsets inset = textView.textContainerInset;
+  static const CGFloat horizontalPadding = 2.0;
+  static const CGFloat verticalPadding = 1.5;
+  static const CGFloat cornerRadius = 6.0;
+
+  UIBezierPath *combinedPath = [UIBezierPath bezierPath];
+
+  for (NSValue *value in _highlightRanges) {
+    NSRange range = value.rangeValue;
+    if (range.location == NSNotFound || range.length == 0) {
+      continue;
+    }
+
+    [textView.layoutManager enumerateEnclosingRectsForGlyphRange:range
+                                      withinSelectedGlyphRange:NSMakeRange(NSNotFound, 0)
+                                               inTextContainer:textView.textContainer
+                                                    usingBlock:^(CGRect rect, BOOL * _Nonnull stop) {
+      if (CGRectIsEmpty(rect) || CGRectIsNull(rect)) {
+        return;
+      }
+
+      CGRect padded = CGRectInset(rect, -horizontalPadding, -verticalPadding);
+      padded.origin.x += inset.left;
+      padded.origin.y += inset.top;
+      CGRect clipped = CGRectIntersection(padded, textViewBounds);
+      if (CGRectIsEmpty(clipped) || CGRectIsNull(clipped)) {
+        return;
+      }
+
+      UIBezierPath *rounded = [UIBezierPath bezierPathWithRoundedRect:clipped cornerRadius:cornerRadius];
+      [combinedPath appendPath:rounded];
+    }];
+  }
+
+  const CGRect highlightBounds = combinedPath.bounds;
+  if (CGRectIsEmpty(highlightBounds) || CGRectIsNull(highlightBounds)) {
+    return;
+  }
+
+  CAShapeLayer *highlightLayer = [CAShapeLayer layer];
+  highlightLayer.frame = textViewBounds;
+  highlightLayer.path = combinedPath.CGPath;
+  highlightLayer.fillColor = (_highlightColor ?: RNUITextViewDefaultHighlightColor()).CGColor;
+  highlightLayer.zPosition = -1;
+
+  [textView.layer addSublayer:highlightLayer];
+  [_highlightLayers addObject:highlightLayer];
 }
 
 Class<RCTComponentViewProtocol> RNUITextViewCls(void)
