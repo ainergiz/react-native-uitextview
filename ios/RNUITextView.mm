@@ -524,8 +524,11 @@ static UIColor *RNUITextViewDefaultHighlightColor(void)
   static const CGFloat horizontalPadding = 2.0;
   static const CGFloat verticalPadding = 1.5;
   static const CGFloat cornerRadius = 6.0;
+  static const CGFloat lineMergeTolerance = 0.5; // Pixels tolerance for "same line"
 
-  UIBezierPath *combinedPath = [UIBezierPath bezierPath];
+  // First collect all rects grouped by line (Y position)
+  // This allows us to merge adjacent rects on the same line
+  NSMutableArray<NSMutableArray<NSValue *> *> *rectsByLine = [NSMutableArray array];
 
   for (NSValue *value in _highlightRanges) {
     NSRange range = value.rangeValue;
@@ -549,9 +552,78 @@ static UIColor *RNUITextViewDefaultHighlightColor(void)
         return;
       }
 
-      UIBezierPath *rounded = [UIBezierPath bezierPathWithRoundedRect:clipped cornerRadius:cornerRadius];
-      [combinedPath appendPath:rounded];
+      // Find which line group this rect belongs to (same Y position)
+      NSMutableArray<NSValue *> *lineGroup = nil;
+      for (NSMutableArray<NSValue *> *group in rectsByLine) {
+        if (group.count > 0) {
+          CGRect firstRect = [group[0] CGRectValue];
+          // Consider rects on same line if their mid-Y positions are within tolerance
+          if (fabs(CGRectGetMidY(clipped) - CGRectGetMidY(firstRect)) < lineMergeTolerance) {
+            lineGroup = group;
+            break;
+          }
+        }
+      }
+
+      if (!lineGroup) {
+        lineGroup = [NSMutableArray array];
+        [rectsByLine addObject:lineGroup];
+      }
+
+      [lineGroup addObject:[NSValue valueWithCGRect:clipped]];
     }];
+  }
+
+  // Now build path: merge adjacent rects on same line, add rounded corners only at edges
+  UIBezierPath *combinedPath = [UIBezierPath bezierPath];
+
+  for (NSMutableArray<NSValue *> *lineGroup in rectsByLine) {
+    if (lineGroup.count == 0) {
+      continue;
+    }
+
+    // Sort rects by X position within this line
+    [lineGroup sortUsingComparator:^NSComparisonResult(NSValue *val1, NSValue *val2) {
+      CGRect rect1 = [val1 CGRectValue];
+      CGRect rect2 = [val2 CGRectValue];
+      if (rect1.origin.x < rect2.origin.x) {
+        return NSOrderedAscending;
+      } else if (rect1.origin.x > rect2.origin.x) {
+        return NSOrderedDescending;
+      }
+      return NSOrderedSame;
+    }];
+
+    // Merge adjacent rects on same line
+    NSMutableArray<NSValue *> *mergedRects = [NSMutableArray array];
+    CGRect currentMerged = [lineGroup[0] CGRectValue];
+
+    for (NSUInteger i = 1; i < lineGroup.count; i++) {
+      CGRect nextRect = [lineGroup[i] CGRectValue];
+      
+      // Check if next rect is adjacent to current merged rect (within tolerance)
+      CGFloat gap = nextRect.origin.x - CGRectGetMaxX(currentMerged);
+      
+      // If gap is small enough (less than 2x corner radius), merge the rects
+      // This creates a continuous highlight with no internal rounded corners
+      if (gap <= cornerRadius * 2) {
+        // Merge: extend current merged rect to include next rect
+        currentMerged = CGRectUnion(currentMerged, nextRect);
+      } else {
+        // Not adjacent: save current merged rect and start new one
+        [mergedRects addObject:[NSValue valueWithCGRect:currentMerged]];
+        currentMerged = nextRect;
+      }
+    }
+    [mergedRects addObject:[NSValue valueWithCGRect:currentMerged]];
+
+    // Add merged rects to path with rounded corners
+    // Each merged rect represents a continuous highlight on this line
+    for (NSValue *value in mergedRects) {
+      CGRect rect = [value CGRectValue];
+      UIBezierPath *rounded = [UIBezierPath bezierPathWithRoundedRect:rect cornerRadius:cornerRadius];
+      [combinedPath appendPath:rounded];
+    }
   }
 
   const CGRect highlightBounds = combinedPath.bounds;
