@@ -9,17 +9,51 @@
 #import <react/renderer/components/RNUITextViewSpec/Props.h>
 #import <react/renderer/components/RNUITextViewSpec/RCTComponentViewHelpers.h>
 #import "RCTFabricComponentsPlugins.h"
+#import <UIKit/UIMenu.h>
+#import <UIKit/UIMenuBuilder.h>
+#import <UIKit/UIMenuSystem.h>
 
 using namespace facebook::react;
 
+static NSString *const RNUITextViewCustomMenuIdentifier = @"xyz.bluesky.RNUITextView.custom";
+
+static UIColor *RNUITextViewDefaultHighlightColor(void)
+{
+  return [UIColor colorWithRed:255.0/255.0 green:214.0/255.0 blue:102.0/255.0 alpha:0.45];
+}
+
+@class RNUITextView;
+
+@interface RNUITextViewInternal : UITextView
+@property (nonatomic, weak) RNUITextView *owner;
+@end
+
 @interface RNUITextView () <RCTRNUITextViewViewProtocol, UIGestureRecognizerDelegate>
+
+- (void)configureMenuWithBuilder:(id<UIMenuBuilder>)builder API_AVAILABLE(ios(13.0));
+- (void)handleMenuActionWithIdentifier:(NSString *)identifier;
+- (void)clearSelectionIfNecessary;
+
+@end
+
+@implementation RNUITextViewInternal
+
+- (void)buildMenuWithBuilder:(id<UIMenuBuilder>)builder API_AVAILABLE(ios(13.0))
+{
+  [super buildMenuWithBuilder:builder];
+  [self.owner configureMenuWithBuilder:builder];
+}
 
 @end
 
 @implementation RNUITextView{
   UIView * _view;
-  UITextView * _textView;
+  RNUITextViewInternal * _textView;
   RNUITextViewShadowNode::ConcreteState::Shared _state;
+  NSArray<NSDictionary<NSString *, NSString *> *> *_menuItems;
+  facebook::react::RNUITextViewMenuBehavior _menuBehavior;
+  NSArray<NSValue *> *_highlightRanges;
+  UIColor *_highlightColor;
 }
 
 + (ComponentDescriptorProvider)componentDescriptorProvider
@@ -37,12 +71,14 @@ using namespace facebook::react;
     self.contentView = _view;
     self.clipsToBounds = true;
 
-    _textView = [[UITextView alloc] init];
+    _textView = [[RNUITextViewInternal alloc] init];
+    _textView.owner = self;
     _textView.scrollEnabled = false;
-    _textView.editable = false;
-    _textView.textContainerInset = UIEdgeInsetsZero;
-    _textView.textContainer.lineFragmentPadding = 0;
-    [self addSubview:_textView];
+  _textView.editable = false;
+  _textView.textContainerInset = UIEdgeInsetsZero;
+  _textView.textContainer.lineFragmentPadding = 0;
+  [self addSubview:_textView];
+  _highlightColor = RNUITextViewDefaultHighlightColor();
 
     const auto longPressGestureRecognizer = [[UILongPressGestureRecognizer alloc] initWithTarget:self
                                                                                           action:@selector(handleLongPressIfNecessary:)];
@@ -69,6 +105,9 @@ using namespace facebook::react;
   // Reset the frame to zero so that when it properly lays out on the next use
   _textView.frame = CGRectZero;
   _textView.attributedText = nil;
+  _menuItems = nil;
+  _highlightRanges = nil;
+  _highlightColor = nil;
 }
 
 - (void)drawRect:(CGRect)rect
@@ -82,7 +121,36 @@ using namespace facebook::react;
   const auto attrString = _state->getData().attributedString;
   const auto convertedAttrString = RCTNSAttributedStringFromAttributedString(attrString);
 
-  _textView.attributedText = convertedAttrString;
+  NSAttributedString *attributedStringToApply = convertedAttrString;
+  if (_highlightRanges.count > 0) {
+    NSMutableAttributedString *mutableString = [convertedAttrString mutableCopy];
+    UIColor *color = _highlightColor ?: RNUITextViewDefaultHighlightColor();
+    const NSUInteger stringLength = mutableString.length;
+
+    for (NSValue *value in _highlightRanges) {
+      NSRange range = value.rangeValue;
+      if (range.location == NSNotFound || range.length == 0) {
+        continue;
+      }
+
+      if (range.location >= stringLength) {
+        continue;
+      }
+
+      NSUInteger clampedLength = MIN(range.length, stringLength - range.location);
+      if (clampedLength == 0) {
+        continue;
+      }
+
+      [mutableString addAttribute:NSBackgroundColorAttributeName
+                            value:color
+                            range:NSMakeRange(range.location, clampedLength)];
+    }
+
+    attributedStringToApply = mutableString;
+  }
+
+  _textView.attributedText = attributedStringToApply;
   _textView.frame = _view.frame;
 
   const auto lines = new std::vector<std::string>();
@@ -144,6 +212,74 @@ using namespace facebook::react;
     _textView.backgroundColor = RCTUIColorFromSharedColor(newViewProps.backgroundColor);
   }
 
+  bool menuChanged = oldViewProps.menuItems.size() != newViewProps.menuItems.size();
+  if (!menuChanged) {
+    for (size_t i = 0; i < newViewProps.menuItems.size(); ++i) {
+      const auto &oldItem = oldViewProps.menuItems[i];
+      const auto &newItem = newViewProps.menuItems[i];
+      if (oldItem.id != newItem.id || oldItem.title != newItem.title) {
+        menuChanged = true;
+        break;
+      }
+    }
+  }
+
+  if (menuChanged || oldViewProps.menuBehavior != newViewProps.menuBehavior) {
+    NSMutableArray<NSDictionary<NSString *, NSString *> *> *items = [NSMutableArray array];
+
+    for (const auto &item : newViewProps.menuItems) {
+      NSString *identifier = [NSString stringWithUTF8String:item.id.c_str()];
+      if (identifier.length == 0) {
+        continue;
+      }
+      NSString *title = [NSString stringWithUTF8String:item.title.c_str()];
+
+      NSMutableDictionary *entry = [NSMutableDictionary dictionaryWithCapacity:2];
+      entry[@"id"] = identifier;
+      if (title.length > 0) {
+        entry[@"title"] = title;
+      }
+      [items addObject:[entry copy]];
+    }
+
+    _menuItems = items.count > 0 ? [items copy] : nil;
+    _menuBehavior = newViewProps.menuBehavior;
+
+    if (@available(iOS 13.0, *)) {
+      [[UIMenuSystem mainSystem] setNeedsRebuild];
+    }
+  }
+
+  bool highlightRangesChanged = oldViewProps.highlightRanges.size() != newViewProps.highlightRanges.size();
+  if (!highlightRangesChanged) {
+    for (size_t i = 0; i < newViewProps.highlightRanges.size(); ++i) {
+      const auto &oldRange = oldViewProps.highlightRanges[i];
+      const auto &newRange = newViewProps.highlightRanges[i];
+      if (oldRange.start != newRange.start || oldRange.end != newRange.end) {
+        highlightRangesChanged = true;
+        break;
+      }
+    }
+  }
+
+  if (highlightRangesChanged) {
+    NSMutableArray<NSValue *> *ranges = [NSMutableArray arrayWithCapacity:newViewProps.highlightRanges.size()];
+    for (const auto &range : newViewProps.highlightRanges) {
+      NSInteger start = MAX(range.start, 0);
+      NSInteger end = MAX(range.end, start);
+      if (end <= start) {
+        continue;
+      }
+      NSUInteger length = (NSUInteger)(end - start);
+      NSRange nsRange = NSMakeRange((NSUInteger)start, length);
+      [ranges addObject:[NSValue valueWithRange:nsRange]];
+    }
+
+    _highlightRanges = ranges.count > 0 ? [ranges copy] : nil;
+
+    [self setNeedsDisplay];
+  }
+
   [super updateProps:props oldProps:oldProps];
 }
 
@@ -152,6 +288,90 @@ using namespace facebook::react;
 {
   _state = std::static_pointer_cast<const RNUITextViewShadowNode::ConcreteState>(state);
   [self setNeedsDisplay];
+}
+
+#pragma mark - Menu Handling
+
+- (void)configureMenuWithBuilder:(id<UIMenuBuilder>)builder API_AVAILABLE(ios(13.0))
+{
+  if (!builder) {
+    return;
+  }
+
+  [builder removeMenuForIdentifier:RNUITextViewCustomMenuIdentifier];
+
+  if (!_menuItems || _menuItems.count == 0) {
+    return;
+  }
+
+  NSMutableArray<UIAction *> *actions = [NSMutableArray arrayWithCapacity:_menuItems.count];
+  __weak RNUITextView *weakSelf = self;
+
+  for (NSDictionary<NSString *, NSString *> *item in _menuItems) {
+    NSString *identifier = item[@"id"];
+    if (identifier.length == 0) {
+      continue;
+    }
+
+    NSString *title = item[@"title"] ?: identifier;
+    NSString *capturedIdentifier = [identifier copy];
+
+    UIAction *action = [UIAction actionWithTitle:title
+                                           image:nil
+                                       identifier:nil
+                                          handler:^(__kindof UIAction * _Nonnull _) {
+                                            [weakSelf handleMenuActionWithIdentifier:capturedIdentifier];
+                                          }];
+    [actions addObject:action];
+  }
+
+  if (actions.count == 0) {
+    return;
+  }
+
+  if (_menuBehavior == facebook::react::RNUITextViewMenuBehavior::Replace) {
+    [builder removeMenuForIdentifier:UIMenuStandardEdit];
+  }
+
+  UIMenu *customMenu = [UIMenu menuWithTitle:@""
+                                       image:nil
+                                   identifier:RNUITextViewCustomMenuIdentifier
+                                      options:UIMenuOptionsDisplayInline
+                                     children:actions];
+
+  [builder insertChildMenu:customMenu atStartOfMenuForIdentifier:UIMenuRoot];
+}
+
+- (void)handleMenuActionWithIdentifier:(NSString *)identifier
+{
+  if (identifier.length == 0 || _eventEmitter == nullptr) {
+    return;
+  }
+
+  NSRange selectedRange = _textView.selectedRange;
+  NSString *selectedText = @"";
+  if (selectedRange.location != NSNotFound && NSMaxRange(selectedRange) <= _textView.text.length) {
+    selectedText = [_textView.text substringWithRange:selectedRange];
+  }
+
+  auto emitter = std::dynamic_pointer_cast<const facebook::react::RNUITextViewEventEmitter>(_eventEmitter);
+  if (emitter == nullptr) {
+    return;
+  }
+
+  const int start = selectedRange.location == NSNotFound ? -1 : static_cast<int>(selectedRange.location);
+  const int end = selectedRange.location == NSNotFound ? -1 : static_cast<int>(NSMaxRange(selectedRange));
+
+  facebook::react::RNUITextViewEventEmitter::OnMenuAction event{
+    static_cast<int>(self.tag),
+    std::string(identifier.UTF8String ?: ""),
+    std::string(selectedText.UTF8String ?: ""),
+    start,
+    end
+  };
+  emitter->onMenuAction(std::move(event));
+
+  [self clearSelectionIfNecessary];
 }
 
 // MARK: - UIGestureRecognizerDelegate
@@ -201,6 +421,8 @@ using namespace facebook::react;
 
   if (child) {
     [child onPress];
+  } else {
+    [self clearSelectionIfNecessary];
   }
 }
 
@@ -211,6 +433,17 @@ using namespace facebook::react;
 
   if (child) {
     [child onLongPress];
+  }
+}
+
+- (void)clearSelectionIfNecessary
+{
+  NSRange range = _textView.selectedRange;
+  if (range.length > 0) {
+    _textView.selectedRange = NSMakeRange(0, 0);
+  }
+  if (_textView.isFirstResponder) {
+    [_textView resignFirstResponder];
   }
 }
 

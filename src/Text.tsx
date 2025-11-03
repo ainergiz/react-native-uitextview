@@ -3,6 +3,7 @@ import {
   Platform,
   StyleSheet,
   Text as RNText,
+  type NativeSyntheticEvent,
   type TextProps,
   type ViewStyle,
 } from 'react-native'
@@ -20,15 +21,47 @@ const textDefaults: TextProps = {
   selectable: true,
 }
 
+export type UITextViewMenuItem = {
+  id: string
+  title: string
+}
+
+export type UITextViewMenuBehavior = 'augment' | 'replace'
+
+type MenuActionNativeEvent = {
+  id: string
+  selectedText: string
+  rangeStart: number
+  rangeEnd: number
+}
+
+export type UITextViewMenuActionNativeEvent = MenuActionNativeEvent
+export type UITextViewMenuActionEvent = NativeSyntheticEvent<MenuActionNativeEvent>
+
+export type UITextViewHighlightRange = {
+  start: number
+  end: number
+}
+
+export type UITextViewProps = TextProps & {
+  uiTextView?: boolean
+  menuItems?: ReadonlyArray<UITextViewMenuItem>
+  menuBehavior?: UITextViewMenuBehavior
+  onMenuAction?: (event: NativeSyntheticEvent<MenuActionNativeEvent>) => void
+  highlightRanges?: ReadonlyArray<UITextViewHighlightRange>
+}
+
 const useTextAncestorContext = () => React.useContext(TextAncestorContext)
 
 function UITextViewChild({
   style,
   children,
+  menuItems,
+  menuBehavior,
+  onMenuAction,
+  highlightRanges,
   ...rest
-}: TextProps & {
-  uiTextView?: boolean
-}) {
+}: UITextViewProps) {
   const [isAncestor, rootStyle] = useTextAncestorContext()
 
   // Flatten the styles, and apply the root styles when needed
@@ -43,9 +76,13 @@ function UITextViewChild({
         <RNUITextViewNativeComponent
           {...textDefaults}
           {...rest}
+          menuItems={menuItems}
+          menuBehavior={menuBehavior}
+          onMenuAction={onMenuAction}
+          highlightRanges={highlightRanges}
           // ellipsizeMode={rest.ellipsizeMode ?? rest.lineBreakMode ?? 'tail'}
           style={[flattenedStyle]}
-          // @ts-expect-error Weirdness
+          // @ts-ignore TODO: align RN native event typing
           onPress={undefined}
           onLongPress={undefined}>
           {React.Children.toArray(children).map((c, index) => {
@@ -53,7 +90,7 @@ function UITextViewChild({
               return c
             } else if (typeof c === 'string' || typeof c === 'number') {
               return (
-                // @ts-expect-error @TODO fix this type
+                // @ts-ignore TODO: narrow child text typing
                 <RNUITextViewChildNativeComponent
                   key={index}
                   style={flattenedStyle}
@@ -93,9 +130,7 @@ function UITextViewChild({
 }
 
 function UITextViewInner(
-  props: TextProps & {
-    uiTextView?: boolean
-  },
+  props: UITextViewProps,
 ) {
   const [isAncestor] = useTextAncestorContext()
 
@@ -108,7 +143,7 @@ function UITextViewInner(
   return <UITextViewChild {...props} />
 }
 
-export function UITextView(props: TextProps & {uiTextView?: boolean}) {
+export function UITextView(props: UITextViewProps) {
   if (Platform.OS !== 'ios') {
     return <RNText {...props} />
   }
