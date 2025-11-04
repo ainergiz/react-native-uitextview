@@ -33,6 +33,7 @@ interface MenuActionEvent extends TargetedEvent {
 interface HighlightRange {
   start: Int32
   end: Int32
+  color?: string  // Optional color (hex string with alpha, e.g., "#FFD66673")
 }
 
 interface NativeProps extends ViewProps {
